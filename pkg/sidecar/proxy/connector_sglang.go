@@ -18,7 +18,6 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -30,6 +29,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
@@ -54,22 +56,9 @@ func init() {
 func (s *Server) handleSGLang(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
 	s.logger.V(logging.DEBUG).Info("running SGLang protocol", "url", prefillPodHostPort)
 
-	// Make Request
-	requestData, err := s.parseSGLangRequest(r)
-
-	if err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
-			s.logger.Error(err, "failed to send error response to client")
-		}
-		return
-	}
-
 	roomID := s.generateSGLangRoomID()
 
-	// Inject bootstrap info for both prefill and decode
-	bootstrapInfo := s.addSGLangBootstrapInfo(requestData, prefillPodHostPort, roomID)
-
-	body, err := json.Marshal(bootstrapInfo)
+	body, err := s.prepareSGLangRequest(r, prefillPodHostPort, roomID)
 	if err != nil {
 		if err := errorJSONInvalid(err, w); err != nil {
 			s.logger.Error(err, "failed to send error response to client")
@@ -177,40 +166,62 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	}
 }
 
-func (s *Server) addSGLangBootstrapInfo(requestData map[string]interface{}, prefillHostPort string, roomID int64) map[string]interface{} {
-	modifiedRequest := make(map[string]interface{})
-	for k, v := range requestData {
-		modifiedRequest[k] = v
+func (s *Server) prepareSGLangRequest(r *http.Request, prefillHostPort string, roomID int64) ([]byte, error) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+	if !gjson.ValidBytes(body) {
+		return nil, fmt.Errorf("failed to parse request body: %w", errInvalidJSON)
+	}
+	parsed := gjson.ParseBytes(body)
+	if !parsed.IsObject() {
+		return nil, fmt.Errorf("failed to parse request body: SGLang request body is not a JSON object")
+	}
+	if err := validateSGLangBootstrapFields(parsed); err != nil {
+		return nil, err
 	}
 
-	// Generate bootstrap host from prefill host
 	bootstrapHost := extractHost(prefillHostPort)
-
-	// Add bootstrap information
-	modifiedRequest[requestFieldBootstrapHost] = bootstrapHost
-	modifiedRequest[requestFieldBootstrapPort] = sglangBootstrapPort
-	modifiedRequest[requestFieldBootstrapRoom] = roomID
+	body, err = sjson.SetBytes(body, requestFieldBootstrapHost, bootstrapHost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add bootstrap host: %w", err)
+	}
+	body, err = sjson.SetBytes(body, requestFieldBootstrapPort, sglangBootstrapPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add bootstrap port: %w", err)
+	}
+	body, err = sjson.SetBytes(body, requestFieldBootstrapRoom, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add bootstrap room: %w", err)
+	}
 
 	s.logger.V(logging.TRACE).Info("bootstrap info added",
 		"bootstrap_host", bootstrapHost,
 		"bootstrap_port", sglangBootstrapPort,
 		"bootstrap_room", roomID)
 
-	return modifiedRequest
+	return body, nil
 }
 
-func (s *Server) parseSGLangRequest(r *http.Request) (map[string]interface{}, error) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read request body: %w", err)
+func validateSGLangBootstrapFields(request gjson.Result) error {
+	counts := map[string]int{
+		requestFieldBootstrapHost: 0,
+		requestFieldBootstrapPort: 0,
+		requestFieldBootstrapRoom: 0,
 	}
-
-	var requestData map[string]interface{}
-	if err := json.Unmarshal(body, &requestData); err != nil {
-		return nil, fmt.Errorf("failed to parse request body: %w", err)
+	request.ForEach(func(key, _ gjson.Result) bool {
+		if _, ok := counts[key.String()]; ok {
+			counts[key.String()]++
+		}
+		return true
+	})
+	for field, count := range counts {
+		if count > 1 {
+			return fmt.Errorf("duplicate top-level SGLang field %q", field)
+		}
 	}
-
-	return requestData, nil
+	return nil
 }
 
 func (s *Server) generateSGLangRoomID() int64 {

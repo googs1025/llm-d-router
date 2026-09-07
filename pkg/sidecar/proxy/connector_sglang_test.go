@@ -40,6 +40,65 @@ var _ = Describe("SGLang Connector", func() {
 		testInfo = sidecarConnectionTestSetup(KVConnectorSGLang)
 	})
 
+	It("should preserve prompt-bearing nested JSON when forwarding requests", func() {
+		testInfo.decodeBackend.Close()
+		testInfo.prefillBackend.Close()
+
+		prefillBodies := make(chan []byte, 1)
+		decodeBodies := make(chan []byte, 1)
+		recordBody := func(ch chan<- []byte) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				Expect(err).ToNot(HaveOccurred())
+				ch <- body
+				w.WriteHeader(http.StatusOK)
+				_, err = w.Write([]byte(`{"id":"ok"}`))
+				Expect(err).ToNot(HaveOccurred())
+			}
+		}
+
+		testInfo.prefillBackend = httptest.NewServer(recordBody(prefillBodies))
+		testInfo.decodeBackend = httptest.NewServer(recordBody(decodeBodies))
+		testInfo.decodeURL, _ = url.Parse(testInfo.decodeBackend.URL)
+		testInfo.proxy = NewProxy(Config{
+			Port:        "0",
+			DecoderURL:  testInfo.decodeURL,
+			KVConnector: KVConnectorSGLang,
+		})
+
+		proxyBaseAddr := testInfo.startProxy()
+		body := `{"model":"Qwen","tools":[{"type":"function","function":{"parameters":{"type":"object","properties":{"query":{"description":"Lookup query","type":"string"}},"required":["query"]},"description":"Lookup a value","name":"lookup"}}],"messages":[{"content":"Call the lookup tool","role":"user"}]}`
+		originalTools := `"tools":[{"type":"function","function":{"parameters":{"type":"object","properties":{"query":{"description":"Lookup query","type":"string"}},"required":["query"]},"description":"Lookup a value","name":"lookup"}}]`
+
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
+		Expect(err).ToNot(HaveOccurred())
+		req.Header.Add(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+
+		rp, err := http.DefaultClient.Do(req)
+		Expect(err).ToNot(HaveOccurred())
+		defer rp.Body.Close()
+		Expect(rp.StatusCode).To(Equal(http.StatusOK))
+
+		var prefillBody []byte
+		Eventually(prefillBodies).Should(Receive(&prefillBody))
+		Expect(string(prefillBody)).To(ContainSubstring(originalTools))
+
+		var decodeBody []byte
+		Eventually(decodeBodies).Should(Receive(&decodeBody))
+		Expect(string(decodeBody)).To(ContainSubstring(originalTools))
+	})
+
+	It("should reject duplicate SGLang bootstrap fields", func() {
+		body := []byte(`{"model":"Qwen","bootstrap_room":"client","bootstrap_room":"override","messages":[{"role":"user","content":"Hello"}]}`)
+
+		req, err := http.NewRequest(http.MethodPost, ChatCompletionsPath, bytes.NewReader(body))
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = testInfo.proxy.prepareSGLangRequest(req, "prefill.example:30080", 123)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`duplicate top-level SGLang field "bootstrap_room"`))
+	})
+
 	It("should successfully send concurrent requests to prefill and decode with bootstrap info", func() {
 		By("starting the proxy")
 		go func() {
