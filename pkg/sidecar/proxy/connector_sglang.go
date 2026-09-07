@@ -167,11 +167,13 @@ func (s *Server) handleSGLangConcurrentRequests(w http.ResponseWriter, r *http.R
 	}
 }
 
+// prepareSGLangRequest returns the request body with SGLang bootstrap fields set.
 func (s *Server) prepareSGLangRequest(r *http.Request, prefillHostPort string, roomID int64) ([]byte, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
+	// Preserve the original request body encoding while adding SGLang bootstrap fields.
 	if !gjson.ValidBytes(body) {
 		return nil, fmt.Errorf("failed to parse request body: %w", errInvalidJSON)
 	}
