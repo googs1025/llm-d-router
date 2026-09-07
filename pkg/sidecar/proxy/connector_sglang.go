@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -176,7 +177,7 @@ func (s *Server) prepareSGLangRequest(r *http.Request, prefillHostPort string, r
 	}
 	parsed := gjson.ParseBytes(body)
 	if !parsed.IsObject() {
-		return nil, fmt.Errorf("failed to parse request body: SGLang request body is not a JSON object")
+		return nil, errors.New("failed to parse request body: SGLang request body is not a JSON object")
 	}
 	if err := validateSGLangBootstrapFields(parsed); err != nil {
 		return nil, err
